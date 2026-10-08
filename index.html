@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>神戸三田キャンパス 地理院×OSM</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root {
+    --bg: #f3f5f4; --panel: #ffffff; --fg: #1d2522; --muted: #5d6b66; --line: #d5ddda;
+    --osm-road: #d6336c; --osm-foot: #7048e8; --osm-steps: #f08c00; --osm-barrier: #e03131;
+    --gsi: #0b7285; --accent: #0b7285;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font: 14px/1.5 system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; color: var(--fg); background: var(--bg); display: flex; flex-direction: column; }
+  header { padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+  h1 { font-size: 15px; margin: 0; font-weight: 700; }
+  .ctl { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; font-size: 13px; }
+  .ctl label { display: inline-flex; gap: 4px; align-items: center; white-space: nowrap; }
+  select, button, input[type=range] { font: inherit; }
+  button { border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  #map { flex: 1; min-height: 300px; }
+  #status { font-size: 12px; color: var(--muted); }
+  .legend { background: var(--panel); padding: 8px 10px; border-radius: 6px; border: 1px solid var(--line); font-size: 12px; line-height: 1.7; }
+  .legend i { display: inline-block; width: 18px; height: 0; border-top: 3px solid; vertical-align: middle; margin-right: 6px; }
+  .legend i.dash { border-top-style: dashed; }
+  .pop table { border-collapse: collapse; font-size: 12px; }
+  .pop td { padding: 1px 6px 1px 0; vertical-align: top; }
+  .pop td:first-child { color: var(--muted); }
+  .pop .num { font-variant-numeric: tabular-nums; font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>関西学院大学 神戸三田キャンパス｜地理院地図 × OSM</h1>
+  <div class="ctl">
+    <label>背景
+      <select id="base">
+        <option value="std" selected>地理院 標準地図</option>
+        <option value="photo">地理院 空中写真</option>
+        <option value="pale">地理院 淡色地図</option>
+        <option value="osm">OSM 標準タイル</option>
+      </select>
+    </label>
+    <label>OSM線の透過 <input id="op" type="range" min="0" max="100" value="90"></label>
+    <label><input id="showGsi" type="checkbox" checked> 地理院 道路中心線</label>
+    <label><input id="showFoot" type="checkbox" checked> 歩道・通路</label>
+    <label><input id="showBarrier" type="checkbox" checked> 障害物(barrier)</label>
+    <button id="reload">表示範囲で再取得</button>
+    <label title="overpass turbo で書き出したGeoJSON、またはOverpassのJSONを読み込めます">OSMファイル読込 <input id="osmFile" type="file" accept=".geojson,.json,application/json"></label>
+    <span id="status">読み込み中…</span>
+  </div>
+</header>
+<div id="map"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+// キャンパス周辺の初期範囲（OSMのキャンパス外周が取れればそれに合わせて自動調整）
+const INIT_CENTER = [34.9626, 135.2105];
+const INIT_ZOOM = 17;
+const OVERPASS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.private.coffee/api/interpreter",
+  "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter"
+];
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+const GSI_ATTR = '<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank">地理院タイル</a>';
+const bases = {
+  photo: L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg", { maxZoom: 20, maxNativeZoom: 18, attribution: GSI_ATTR }),
+  std:   L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png", { maxZoom: 20, maxNativeZoom: 18, attribution: GSI_ATTR }),
+  pale:  L.tileLayer("https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", { maxZoom: 20, maxNativeZoom: 18, attribution: GSI_ATTR }),
+  osm:   L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 20, maxNativeZoom: 19, attribution: '&copy; OpenStreetMap contributors' })
+};
+const map = L.map("map", { zoomControl: true }).setView(INIT_CENTER, INIT_ZOOM);
+let curBase = bases.std.addTo(map);
+L.control.scale({ imperial: false }).addTo(map);
+
+document.getElementById("base").addEventListener("change", e => {
+  map.removeLayer(curBase); curBase = bases[e.target.value].addTo(map); curBase.bringToBack();
+});
+
+const legend = L.control({ position: "bottomright" });
+legend.onAdd = () => {
+  const d = L.DomUtil.create("div", "legend");
+  d.innerHTML =
+    `<div><i style="border-color:${css('--gsi')}" class="dash"></i>地理院 道路中心線</div>` +
+    `<div><i style="border-color:${css('--osm-road')}"></i>OSM 車道</div>` +
+    `<div><i style="border-color:${css('--osm-foot')}"></i>OSM 歩道・通路</div>` +
+    `<div><i style="border-color:${css('--osm-steps')}"></i>OSM 階段</div>` +
+    `<div><i style="border-color:${css('--osm-barrier')}"></i>OSM barrier</div>` +
+    `<div style="color:${css('--muted')}">線をタップで属性とズレ量</div>`;
+  return d;
+};
+legend.addTo(map);
+
+const status = t => document.getElementById("status").textContent = t;
+
+// ---------- 地理院 道路中心線（GeoJSONタイル z16） ----------
+const gsiLayer = L.layerGroup().addTo(map);
+let gsiSegs = []; // [[lat1,lon1,lat2,lon2], ...]
+const gsiLoaded = new Set();
+
+function lon2tile(lon, z) { return Math.floor((lon + 180) / 360 * 2 ** z); }
+function lat2tile(lat, z) { const r = lat * Math.PI / 180; return Math.floor((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * 2 ** z); }
+
+async function loadGsiCenterlines(bounds) {
+  const z = 16;
+  const x0 = lon2tile(bounds.getWest(), z), x1 = lon2tile(bounds.getEast(), z);
+  const y0 = lat2tile(bounds.getNorth(), z), y1 = lat2tile(bounds.getSouth(), z);
+  const jobs = [];
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) {
+    const key = `${x}/${y}`;
+    if (gsiLoaded.has(key)) continue;
+    gsiLoaded.add(key);
+    jobs.push(fetch(`https://cyberjapandata.gsi.go.jp/xyz/experimental_rdcl/${z}/${x}/${y}.geojson`)
+      .then(r => r.ok ? r.json() : null).catch(() => null));
+  }
+  const res = await Promise.all(jobs);
+  let n = 0;
+  res.forEach(gj => {
+    if (!gj || !gj.features) return;
+    gj.features.forEach(f => {
+      const g = f.geometry; if (!g) return;
+      const lines = g.type === "LineString" ? [g.coordinates] : g.type === "MultiLineString" ? g.coordinates : [];
+      lines.forEach(cs => {
+        const ll = cs.map(c => [c[1], c[0]]);
+        for (let i = 0; i < ll.length - 1; i++) gsiSegs.push([ll[i][0], ll[i][1], ll[i + 1][0], ll[i + 1][1]]);
+        const p = f.properties || {};
+        L.polyline(ll, { color: css("--gsi"), weight: 4, dashArray: "8 6", opacity: 0.95 })
+          .bindPopup(`<div class="pop"><b>地理院 道路中心線</b><table>${
+            Object.entries(p).map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("")}</table></div>`)
+          .addTo(gsiLayer);
+        n++;
+      });
+    });
+  });
+  return n;
+}
+
+// ---------- 距離計算（局所平面近似, m） ----------
+function toXY(lat, lon, lat0) {
+  const R = 6378137, k = Math.PI / 180;
+  return [lon * k * R * Math.cos(lat0 * k), lat * k * R];
+}
+function distPointSeg(p, a, b) {
+  const dx = b[0] - a[0], dy = b[1] - a[1];
+  const L2 = dx * dx + dy * dy;
+  let t = L2 ? ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / L2 : 0;
+  t = Math.max(0, Math.min(1, t));
+  const x = a[0] + t * dx - p[0], y = a[1] + t * dy - p[1];
+  return Math.hypot(x, y);
+}
+function offsetStats(latlngs) {
+  if (!gsiSegs.length) return null;
+  const lat0 = latlngs[0][0];
+  const segs = gsiSegs.map(s => [toXY(s[0], s[1], lat0), toXY(s[2], s[3], lat0)]);
+  const ds = latlngs.map(([la, lo]) => {
+    const p = toXY(la, lo, lat0);
+    let m = Infinity;
+    for (const [a, b] of segs) { const d = distPointSeg(p, a, b); if (d < m) m = d; }
+    return m;
+  });
+  const sorted = [...ds].sort((a, b) => a - b);
+  return { mean: ds.reduce((a, b) => a + b, 0) / ds.length, median: sorted[Math.floor(sorted.length / 2)], max: sorted[sorted.length - 1], n: ds.length };
+}
+
+// ---------- OSM（Overpass API） ----------
+const osmRoad = L.layerGroup().addTo(map);
+const osmFoot = L.layerGroup().addTo(map);
+const osmBarrier = L.layerGroup().addTo(map);
+const campusLayer = L.layerGroup().addTo(map);
+const ROAD = new Set(["motorway","trunk","primary","secondary","tertiary","unclassified","residential","service","living_street","motorway_link","trunk_link","primary_link","secondary_link","tertiary_link","road"]);
+
+async function overpass(q) {
+  const errs = [];
+  for (const url of OVERPASS) {
+    const host = new URL(url).host;
+    status(`OSMデータ取得中… (${host})`);
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 45000);
+    try {
+      const r = await fetch(url + "?data=" + encodeURIComponent(q), { signal: ctl.signal });
+      clearTimeout(timer);
+      if (r.ok) return await r.json();
+      errs.push(`${host}: HTTP ${r.status}`);
+    } catch (e) {
+      clearTimeout(timer);
+      errs.push(`${host}: ${e.name === "AbortError" ? "タイムアウト" : "接続不可"}`);
+    }
+  }
+  throw new Error(errs.join(" / "));
+}
+
+function opacity() { return document.getElementById("op").value / 100; }
+
+function popupFor(el, kind, latlngs) {
+  const t = el.tags || {};
+  const rows = Object.entries(t).map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+  let off = "";
+  if (latlngs && latlngs.length > 1) {
+    const s = offsetStats(latlngs);
+    off = s ? `<tr><td>地理院中心線との距離</td><td class="num">平均 ${s.mean.toFixed(2)} m / 中央値 ${s.median.toFixed(2)} m / 最大 ${s.max.toFixed(2)} m（${s.n}点）</td></tr>`
+            : `<tr><td>地理院中心線との距離</td><td>この範囲に中心線データなし</td></tr>`;
+  }
+  return `<div class="pop"><b>OSM ${kind}</b> <a href="https://www.openstreetmap.org/${el.type}/${el.id}" target="_blank">${el.type}/${el.id}</a><table>${rows}${off}</table></div>`;
+}
+
+async function loadOsm(bounds) {
+  const b = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
+  const q = `[out:json][timeout:60];
+    (
+      way["highway"](${b});
+      way["barrier"](${b});
+      node["barrier"](${b});
+      node["highway"~"^(crossing|street_lamp|traffic_signals|stop)$"](${b});
+      way["amenity"="university"](${b});
+      relation["amenity"="university"](${b});
+    );
+    out geom tags;`;
+  const data = await overpass(q);
+  return renderOsm(data.elements);
+}
+
+// overpass turbo の GeoJSON を Overpass 形式の要素に変換
+function geojsonToElements(gj) {
+  const out = [];
+  (gj.features || []).forEach((f, i) => {
+    const g = f.geometry; if (!g) return;
+    const p = f.properties || {};
+    const tags = p.tags || Object.fromEntries(Object.entries(p).filter(([k]) => !k.startsWith("@") && k !== "id"));
+    const idStr = String(p["@id"] || f.id || `feature/${i}`);
+    const [type, id] = idStr.includes("/") ? idStr.split("/") : ["way", idStr];
+    const push = cs => out.push({ type: type === "relation" ? "way" : type, id, tags, geometry: cs.map(c => ({ lat: c[1], lon: c[0] })) });
+    if (g.type === "Point") out.push({ type: "node", id, tags, lat: g.coordinates[1], lon: g.coordinates[0] });
+    else if (g.type === "LineString") push(g.coordinates);
+    else if (g.type === "MultiLineString" || g.type === "Polygon") g.coordinates.forEach(push);
+    else if (g.type === "MultiPolygon") g.coordinates.forEach(poly => poly.forEach(push));
+  });
+  return out;
+}
+
+function renderOsm(elements) {
+  [osmRoad, osmFoot, osmBarrier, campusLayer].forEach(l => l.clearLayers());
+  let campusBounds = null, cnt = { road: 0, foot: 0, barrier: 0 };
+  for (const el of elements) {
+    const t = el.tags || {};
+    if (el.type === "way" && el.geometry) {
+      const ll = el.geometry.map(g => [g.lat, g.lon]);
+      if (t.amenity === "university") {
+        const pl = L.polygon(ll, { color: css("--muted"), weight: 1.5, dashArray: "2 4", fill: false, interactive: false }).addTo(campusLayer);
+        if ((t.name || "").includes("関西学院")) campusBounds = campusBounds ? campusBounds.extend(pl.getBounds()) : pl.getBounds();
+        continue;
+      }
+      if (t.barrier) {
+        L.polyline(ll, { color: css("--osm-barrier"), weight: 3, opacity: opacity() }).bindPopup(() => popupFor(el, "barrier")).addTo(osmBarrier);
+        cnt.barrier++; continue;
+      }
+      if (t.highway) {
+        const isRoad = ROAD.has(t.highway);
+        const color = t.highway === "steps" ? css("--osm-steps") : isRoad ? css("--osm-road") : css("--osm-foot");
+        L.polyline(ll, { color, weight: isRoad ? 4 : 3, opacity: opacity() })
+          .bindPopup(() => popupFor(el, `highway=${t.highway}`, ll))
+          .addTo(isRoad ? osmRoad : osmFoot);
+        isRoad ? cnt.road++ : cnt.foot++;
+      }
+    } else if (el.type === "relation" && t.amenity === "university" && el.members) {
+      el.members.filter(m => m.geometry).forEach(m => {
+        const pl = L.polyline(m.geometry.map(g => [g.lat, g.lon]), { color: css("--muted"), weight: 1.5, dashArray: "2 4", interactive: false }).addTo(campusLayer);
+        if ((t.name || "").includes("関西学院")) campusBounds = campusBounds ? campusBounds.extend(pl.getBounds()) : pl.getBounds();
+      });
+    } else if (el.type === "node") {
+      L.circleMarker([el.lat, el.lon], { radius: 4, color: css("--osm-barrier"), weight: 2, fillOpacity: 0.6, opacity: opacity() })
+        .bindPopup(() => popupFor(el, t.barrier ? `barrier=${t.barrier}` : `highway=${t.highway}`))
+        .addTo(osmBarrier);
+      cnt.barrier++;
+    }
+  }
+  return { cnt, campusBounds };
+}
+
+async function loadAll(first) {
+  // 少し広めに取る
+  const bounds = map.getBounds().pad(0.3);
+  // 地理院とOSMを別々に扱い、片方が失敗してももう片方は表示する
+  loadGsiCenterlines(bounds).catch(() => {});
+  try {
+    const osm = await loadOsm(bounds);
+    status(summary(osm.cnt));
+    if (first && osm.campusBounds) { map.fitBounds(osm.campusBounds, { padding: [20, 20] }); setTimeout(() => loadAll(false), 600); }
+  } catch (e) {
+    status(`OSMデータを取得できませんでした（${e.message}）。「表示範囲で再取得」を押すか、「OSMファイル読込」でファイルを読み込んでください。`);
+  }
+}
+
+function summary(cnt) {
+  return `OSM: 車道 ${cnt.road} / 歩道・通路 ${cnt.foot} / barrier ${cnt.barrier}　地理院中心線: ${gsiSegs.length} 区間`;
+}
+
+document.getElementById("osmFile").addEventListener("change", e => {
+  const f = e.target.files[0]; if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => {
+    try {
+      const j = JSON.parse(rd.result);
+      const els = j.elements ? j.elements : geojsonToElements(j);
+      const osm = renderOsm(els);
+      const all = L.latLngBounds([]);
+      [osmRoad, osmFoot, osmBarrier].forEach(g => g.eachLayer(l => all.extend(l.getBounds ? l.getBounds() : l.getLatLng())));
+      if (all.isValid()) { map.fitBounds(all, { padding: [20, 20] }); loadGsiCenterlines(map.getBounds().pad(0.3)).then(() => status(summary(osm.cnt))); }
+      status(summary(osm.cnt) + `（${f.name} から読込）`);
+    } catch (err) {
+      status("ファイルを読み込めませんでした。GeoJSONかOverpassのJSONか確認してください。");
+    }
+  };
+  rd.readAsText(f);
+});
+
+document.getElementById("reload").addEventListener("click", () => loadAll(false));
+document.getElementById("op").addEventListener("input", () => {
+  const o = opacity();
+  [osmRoad, osmFoot, osmBarrier].forEach(g => g.eachLayer(l => l.setStyle({ opacity: o })));
+});
+const toggle = (id, layer) => document.getElementById(id).addEventListener("change", e => e.target.checked ? layer.addTo(map) : map.removeLayer(layer));
+toggle("showGsi", gsiLayer); toggle("showFoot", osmFoot); toggle("showBarrier", osmBarrier);
+
+loadAll(true);
+</script>
+</body>
+</html>
